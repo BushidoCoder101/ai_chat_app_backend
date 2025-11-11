@@ -1,12 +1,12 @@
 import os
 import sqlite3
 import time
+# NEW: Added 'g' to imports for database request context
 from flask import Flask, request, jsonify, g
-from flask_cors import CORS 
+from flask_cors import CORS, cross_origin
 
 # --- LangChain Imports ---
 from langchain_community.chat_models import ChatOllama
-# NEW: Import MessagesPlaceholder for conversation history
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 # -------------------------
@@ -15,10 +15,9 @@ from langchain_core.output_parsers import StrOutputParser
 class Config:
     """Application configuration settings."""
     
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:1b") 
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b") # Changed to a common default
     DATABASE_PATH = os.getenv("DATABASE_PATH", "ollama_chat_v2.db")
     LOG_LEVEL = 'INFO' 
-    # NEW: Updated system prompt for a more capable agent
     LLM_SYSTEM_PROMPT = (
         "You are an expert-level personal assistant, skilled in all subjects. "
         "You will be given the current conversation history. "
@@ -28,6 +27,7 @@ class Config:
 # --- Database Management ---
 def get_db_connection():
     """Establishes a connection to the SQLite database and uses 'g' for reuse."""
+    # 'g' is used to store data during the lifetime of a single request.
     if 'db' not in g:
         g.db = sqlite3.connect(Config.DATABASE_PATH)
         g.db.row_factory = sqlite3.Row
@@ -61,7 +61,6 @@ def initialize_llm_chain(app):
     try:
         llm = ChatOllama(model=Config.OLLAMA_MODEL)
         
-        # NEW: The prompt now includes a placeholder for conversation history
         prompt = ChatPromptTemplate.from_messages([
             ("system", Config.LLM_SYSTEM_PROMPT),
             MessagesPlaceholder(variable_name="chat_history"), # For memory
@@ -82,7 +81,13 @@ def create_app(test_config=None):
     """The application factory function."""
     app = Flask(__name__)
     app.config.from_object(Config)
-    CORS(app) 
+    
+    # Initialize CORS to allow requests from your frontend.
+    # NOTE: using '*' with credentials is disallowed by browsers. If your frontend
+    # uses cookies or Authorization headers with `fetch(..., credentials: 'include')`
+    # set `supports_credentials=True` and list explicit origins below.
+    # Assumption: frontend runs on http://localhost:3000 — change if different.
+    CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}}, supports_credentials=True)
     
     init_db(app)
     app.teardown_appcontext(close_db)
@@ -92,7 +97,6 @@ def create_app(test_config=None):
     @app.route('/status', methods=['GET'])
     def get_status():
         """Checks the readiness of the LLM chain."""
-        # ... (same as your file)
         if app.llm_chain:
             return jsonify({
                 "status": "ready", 
@@ -102,16 +106,22 @@ def create_app(test_config=None):
         else:
             return jsonify({"status": "error", "message": "LLM chain failed to initialize."}), 503
 
-    @app.route('/ask', methods=['POST'])
+    @app.route('/ask', methods=['POST', 'OPTIONS'])
+    @cross_origin()
     def ask_llm():
         """Handles new questions, incorporating chat history."""
+        
+        # --- Handle OPTIONS preflight request (kept for clarity) ---
+        # `@cross_origin` will ensure the proper CORS headers are attached.
+        if request.method == 'OPTIONS':
+            return jsonify({"success": True}), 200
+
         if not app.llm_chain:
             return jsonify({"error": f"LLM not ready."}), 503
 
         try:
             data = request.get_json()
             user_question = data.get('question')
-            # NEW: Get the chat history from the request
             chat_history = data.get('history', [])
             
             if not user_question:
@@ -119,9 +129,6 @@ def create_app(test_config=None):
 
             app.logger.info(f"Received question: {user_question}")
 
-            # NEW: Format history for LangChain
-            # React sends: [{'role': 'user', 'content': '...'}, {'role': 'ai', 'content': '...'}]
-            # LangChain expects: [('human', '...'), ('ai', '...')]
             formatted_history = []
             for msg in chat_history:
                 if msg.get('role') == 'user':
@@ -138,15 +145,18 @@ def create_app(test_config=None):
             end_time = time.time()
             # ----------------------------------
 
-            # Save to database (only the *first* user question of a session)
-            # We only save if there is no history, to prevent duplicates
+            # Save to database (only if it's the first message of a session)
             if not formatted_history:
-                conn = get_db_connection()
-                conn.execute(
-                    "INSERT INTO interactions (question, answer) VALUES (?, ?)",
-                    (user_question, llm_response)
-                )
-                conn.commit()
+                try:
+                    conn = get_db_connection()
+                    conn.execute(
+                        "INSERT INTO interactions (question, answer) VALUES (?, ?)",
+                        (user_question, llm_response)
+                    )
+                    conn.commit()
+                except Exception as db_error:
+                    app.logger.error(f"Database save error: {db_error}", exc_info=True)
+
 
             app.logger.info(f"LLM Answer generated in {end_time - start_time:.2f}s")
             return jsonify({"answer": llm_response})
@@ -158,7 +168,6 @@ def create_app(test_config=None):
     @app.route('/history', methods=['GET'])
     def get_history():
         """Retrieves all past Q&A interactions, newest first."""
-        # ... (same as your file)
         try:
             conn = get_db_connection()
             rows = conn.execute(
@@ -169,7 +178,7 @@ def create_app(test_config=None):
                 "id": row['id'],
                 "question": row['question'],
                 "answer": row['answer'],
-                "timestamp": row['timestamp'].split('.')[0] # Keep split for display consistency
+                "timestamp": row['timestamp'].split('.')[0]
             } for row in rows]
 
             return jsonify(history)
@@ -177,12 +186,25 @@ def create_app(test_config=None):
             app.logger.error(f"Error fetching history: {e}", exc_info=True)
             return jsonify({"error": f"Error fetching history: {str(e)}"}), 500
 
-    # --- NEW: Delete Endpoint ---
+    # --- UPDATED: Delete Endpoint ---
     @app.route('/history/delete', methods=['POST', 'OPTIONS'])
+    @cross_origin()
     def delete_interaction():
         """Deletes a single interaction from the database based on its ID."""
+        
+        # --- NEW: Handle OPTIONS preflight request ---
+        # This is crucial for CORS when the frontend sends a POST/DELETE
+        if request.method == 'OPTIONS':
+            # The CORS(app) setup will attach the appropriate headers.
+            return jsonify({"success": True}), 200
+        # ---------------------------------------------
+
+        # --- POST Logic (moved from try block) ---
         try:
             data = request.get_json()
+            if not data:
+                return jsonify({"error": "No JSON body provided"}), 400
+                
             item_id = data.get('id')
             
             if not item_id:
@@ -190,7 +212,6 @@ def create_app(test_config=None):
 
             conn = get_db_connection()
             
-            # Use the primary key (id) for a precise and safe delete
             cursor = conn.execute(
                 "DELETE FROM interactions WHERE id = ?",
                 (item_id,)
